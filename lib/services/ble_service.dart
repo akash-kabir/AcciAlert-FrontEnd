@@ -20,13 +20,19 @@ class AccidentEvent {
   };
 }
 
-/// Data model for periodic location updates from ESP32.
+/// Data model for periodic location & battery updates from ESP32.
 class LocationEvent {
   final String deviceId;
   final double lat;
   final double lon;
+  final int? battery;
 
-  LocationEvent({required this.deviceId, required this.lat, required this.lon});
+  LocationEvent({
+    required this.deviceId,
+    required this.lat,
+    required this.lon,
+    this.battery,
+  });
 }
 
 /// BLE service that scans, connects, and listens to the ESP32 accident device.
@@ -47,6 +53,7 @@ class BleService {
 
   final _accidentController = StreamController<AccidentEvent>.broadcast();
   final _locationController = StreamController<LocationEvent>.broadcast();
+  final _batteryController = StreamController<int>.broadcast();
   final _statusController = StreamController<String>.broadcast();
   final _connectionStateController =
       StreamController<BleConnectionState>.broadcast();
@@ -56,6 +63,9 @@ class BleService {
 
   /// Stream of periodic location events received via BLE.
   Stream<LocationEvent> get locationStream => _locationController.stream;
+
+  /// Stream of battery level (0-100) received via BLE
+  Stream<int> get batteryStream => _batteryController.stream;
 
   /// Stream of status messages for UI display
   Stream<String> get statusStream => _statusController.stream;
@@ -100,7 +110,6 @@ class BleService {
 
   /// Start scanning for the ESP32 device
   Future<void> startScan() async {
-    // Prevent concurrent scan attempts
     if (_scanInProgress) {
       _statusController.add('Scan already in progress.');
       return;
@@ -111,15 +120,12 @@ class BleService {
     _statusController.add('Scanning for $deviceName...');
     _connectionStateController.add(BleConnectionState.scanning);
 
-    // Clean up any previous scan
     await _scanSubscription?.cancel();
     _scanSubscription = null;
     await FlutterBluePlus.stopScan();
 
-    // Brief delay for Android system to stabilize (prevent "scanning too frequently" error)
     await Future.delayed(const Duration(milliseconds: 100));
 
-    // Set up listener BEFORE checking system devices or starting scan
     _scanSubscription = FlutterBluePlus.onScanResults.listen((results) {
       for (var result in results) {
         final platformName = result.device.platformName;
@@ -130,14 +136,12 @@ class BleService {
             .toList();
         final mac = result.device.remoteId.toString();
 
-        // Log ALL discovered devices (including unnamed) for debugging
         _statusController.add(
           'BLE: ${name.isEmpty ? "(no name)" : name} '
           '[$mac] '
           'services: $serviceUuids',
         );
 
-        // Match by name OR by advertised service UUID
         final nameMatch = name == deviceName || name.contains('Accident');
         final uuidMatch = serviceUuids.contains(serviceUuid.toLowerCase());
 
@@ -154,7 +158,6 @@ class BleService {
       }
     });
 
-    // First check if already bonded/system-connected from a previous session
     try {
       final systemDevices = await FlutterBluePlus.systemDevices([]);
       for (var device in systemDevices) {
@@ -185,7 +188,6 @@ class BleService {
 
     _scanInProgress = false;
 
-    // Only show "not found" if scan completed without finding device
     if (!_deviceFound && _connectedDevice == null) {
       _statusController.add('Device not found. Try again.');
       _connectionStateController.add(BleConnectionState.disconnected);
@@ -201,7 +203,6 @@ class BleService {
       await device.connect(timeout: const Duration(seconds: 10));
       _connectedDevice = device;
 
-      // Listen for disconnection
       _connectionSubscription = device.connectionState.listen((state) {
         if (state == BluetoothConnectionState.disconnected) {
           _statusController.add('Device disconnected.');
@@ -230,9 +231,8 @@ class BleService {
         for (var char in service.characteristics) {
           if (char.uuid.toString().toLowerCase() ==
               characteristicUuid.toLowerCase()) {
-            // Enable notifications
             await char.setNotifyValue(true);
-            _statusController.add('Subscribed to accident notifications.');
+            _statusController.add('Subscribed to notifications.');
 
             _notifySubscription = char.lastValueStream.listen((value) {
               if (value.isNotEmpty) {
@@ -250,8 +250,9 @@ class BleService {
 
   /// Parse BLE payload from ESP32.
   /// Supported formats:
-  /// - ACCIDENT|device_id|lat|lon
-  /// - LOCATION|device_id|lat|lon
+  /// - ACCIDENT|device_id|lat|lon[|battery]
+  /// - LOCATION|device_id|lat|lon[|battery]
+  /// - BATTERY|percentage
   void _handleBleData(List<int> data) {
     try {
       final message = utf8.decode(data);
@@ -263,6 +264,11 @@ class BleService {
         final deviceId = parts[1];
         final lat = double.parse(parts[2]);
         final lon = double.parse(parts[3]);
+        final battery = parts.length >= 5 ? int.tryParse(parts[4]) : null;
+
+        if (battery != null) {
+          _batteryController.add(battery);
+        }
 
         if (type == 'ACCIDENT') {
           _accidentController.add(
@@ -270,8 +276,18 @@ class BleService {
           );
         } else if (type == 'LOCATION') {
           _locationController.add(
-            LocationEvent(deviceId: deviceId, lat: lat, lon: lon),
+            LocationEvent(
+              deviceId: deviceId,
+              lat: lat,
+              lon: lon,
+              battery: battery,
+            ),
           );
+        }
+      } else if (parts.length >= 2 && parts[0] == 'BATTERY') {
+        final battery = int.tryParse(parts[1]);
+        if (battery != null) {
+          _batteryController.add(battery);
         }
       }
     } catch (e) {
@@ -302,6 +318,7 @@ class BleService {
     _connectionSubscription?.cancel();
     _accidentController.close();
     _locationController.close();
+    _batteryController.close();
     _statusController.close();
     _connectionStateController.close();
   }

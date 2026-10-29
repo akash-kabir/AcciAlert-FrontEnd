@@ -7,8 +7,8 @@ import 'package:permission_handler/permission_handler.dart';
 
 import '../services/api_service.dart';
 import '../services/ble_service.dart';
+import '../services/sms_service.dart';
 import '../services/webhook_service.dart';
-import '../widgets/glass_card.dart';
 import 'accident_alert_screen.dart';
 import 'contacts_screen.dart';
 import 'login_screen.dart';
@@ -23,6 +23,7 @@ class HomeScreen extends StatefulWidget {
 class _HomeScreenState extends State<HomeScreen> {
   final BleService _bleService = BleService();
   final WebhookService _webhookService = WebhookService();
+  final SmsService _smsService = SmsService();
 
   BleConnectionState _connectionState = BleConnectionState.disconnected;
   bool _alertShowing = false;
@@ -35,78 +36,114 @@ class _HomeScreenState extends State<HomeScreen> {
   late StreamSubscription<BleConnectionState> _connectionSub;
   late StreamSubscription<AccidentEvent> _accidentSub;
   late StreamSubscription<LocationEvent> _locationSub;
+  late StreamSubscription<int> _batterySub;
 
   @override
   void initState() {
     super.initState();
 
+    _smsService.requestSmsPermission();
+
     _statusSub = _bleService.statusStream.listen((_) {});
 
     _connectionSub = _bleService.connectionStateStream.listen((state) {
-      setState(() => _connectionState = state);
-      if (state == BleConnectionState.connected) {
-        _refreshDeviceDetails();
-      }
-      if (state == BleConnectionState.disconnected) {
-        setState(() {
+      if (!mounted) return;
+      setState(() {
+        _connectionState = state;
+        if (state == BleConnectionState.connected) {
+          _deviceName = _bleService.connectedDeviceName.isNotEmpty
+              ? _bleService.connectedDeviceName
+              : 'AcciAlert Device';
+        } else {
           _deviceName = '--';
           _batteryText = '--';
-          _lastLat = null;
-          _lastLon = null;
-        });
-      }
+        }
+      });
     });
 
     _accidentSub = _bleService.accidentStream.listen((event) {
-      setState(() {
-        _lastLat = event.lat;
-        _lastLon = event.lon;
-      });
+      if (!mounted) return;
       _onAccidentDetected(event);
     });
 
     _locationSub = _bleService.locationStream.listen((event) {
+      if (!mounted) return;
       setState(() {
         _lastLat = event.lat;
         _lastLon = event.lon;
+        if (event.battery != null) {
+          _batteryText = '${event.battery}%';
+        }
+      });
+    });
+
+    _batterySub = _bleService.batteryStream.listen((battery) {
+      if (!mounted) return;
+      setState(() {
+        _batteryText = '$battery%';
       });
     });
   }
 
-  Future<void> _refreshDeviceDetails() async {
-    final battery = await _bleService.readBatteryLevel();
-    if (!mounted) return;
-    setState(() {
-      _deviceName = _bleService.connectedDeviceName;
-      _batteryText = battery == null ? 'Unknown' : '$battery%';
-    });
-  }
-
-  Future<void> _requestPermissions() async {
+  Future<bool> _requestBluetoothPermissions() async {
     if (Platform.isAndroid) {
-      await [
+      final statuses = await [
         Permission.bluetoothScan,
         Permission.bluetoothConnect,
         Permission.locationWhenInUse,
+        Permission.sms,
       ].request();
+
+      final allGranted = statuses.values.every((s) => s.isGranted);
+      if (!allGranted) {
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(
+              content: Text('Permissions required for Bluetooth and SMS'),
+              backgroundColor: Colors.red,
+            ),
+          );
+        }
+        return false;
+      }
     }
+    return true;
   }
 
   Future<void> _handleScan() async {
-    // Check if Bluetooth is on
-    final adapterState = await FlutterBluePlus.adapterState.first;
-    if (adapterState != BluetoothAdapterState.on) {
-      if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(
-          content: Text('Bluetooth is OFF. Please enable Bluetooth.'),
-        ),
-      );
+    final hasPermissions = await _requestBluetoothPermissions();
+    if (!hasPermissions) return;
+
+    if (!await FlutterBluePlus.isSupported) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('Bluetooth not supported on this device'),
+            backgroundColor: Colors.red,
+          ),
+        );
+      }
       return;
     }
 
-    await _requestPermissions();
-    await _bleService.startScan();
+    final adapterState = await FlutterBluePlus.adapterState.first;
+    if (adapterState != BluetoothAdapterState.on) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('Please turn on Bluetooth'),
+            backgroundColor: Colors.orange,
+          ),
+        );
+      }
+      return;
+    }
+
+    _bleService.startScan();
+  }
+
+  void _handleDisconnect() {
+    _bleService.disconnect();
   }
 
   void _onAccidentDetected(AccidentEvent event) {
@@ -118,6 +155,7 @@ class _HomeScreenState extends State<HomeScreen> {
           MaterialPageRoute(
             builder: (_) => AccidentAlertScreen(
               event: event,
+              smsService: _smsService,
               webhookService: _webhookService,
             ),
           ),
@@ -133,33 +171,9 @@ class _HomeScreenState extends State<HomeScreen> {
 
   Future<void> _logout() async {
     await ApiService.logout();
-    if (!context.mounted) return;
-    Navigator.of(context).pushAndRemoveUntil(
+    if (!mounted) return;
+    Navigator.of(context).pushReplacement(
       MaterialPageRoute(builder: (_) => const LoginScreen()),
-      (route) => false,
-    );
-  }
-
-  void _showSettingsCard() {
-    showModalBottomSheet<void>(
-      context: context,
-      backgroundColor: Colors.transparent,
-      builder: (ctx) => SafeArea(
-        child: Padding(
-          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 12),
-          child: Card(
-            child: ListTile(
-              leading: const Icon(Icons.logout, color: Colors.redAccent),
-              title: const Text('Logout'),
-              subtitle: const Text('Sign out from this device'),
-              onTap: () {
-                Navigator.of(ctx).pop();
-                _logout();
-              },
-            ),
-          ),
-        ),
-      ),
     );
   }
 
@@ -169,69 +183,20 @@ class _HomeScreenState extends State<HomeScreen> {
     _connectionSub.cancel();
     _accidentSub.cancel();
     _locationSub.cancel();
+    _batterySub.cancel();
     _bleService.dispose();
     super.dispose();
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    return Scaffold(
-      appBar: AppBar(
-        title: const Text('Acci-Alert'),
-        actions: [
-          IconButton(
-            icon: const Icon(Icons.settings),
-            tooltip: 'Settings',
-            onPressed: _showSettingsCard,
-          ),
-          const SizedBox(width: 12),
-        ],
-      ),
-      body: Container(
-        decoration: const BoxDecoration(
-          gradient: LinearGradient(
-            begin: Alignment.topLeft,
-            end: Alignment.bottomRight,
-            colors: [Color(0xFF1A212B), Color(0xFF0F1318), Color(0xFF1E171E)],
-          ),
-        ),
-        child: Column(
-          children: [
-            Expanded(
-              child: Padding(
-                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 8),
-                child: _connectionState == BleConnectionState.connected
-                    ? _buildConnectedView()
-                    : _buildBleButtonView(),
-              ),
-            ),
-            if (_connectionState != BleConnectionState.connected)
-              SafeArea(
-                top: false,
-                child: Padding(
-                  padding: const EdgeInsets.fromLTRB(8, 0, 8, 8),
-                  child: ElevatedButton.icon(
-                    onPressed: _openContacts,
-                    icon: const Icon(Icons.contacts),
-                    label: const Text('Emergency Contacts'),
-                  ),
-                ),
-              ),
-          ],
-        ),
-      ),
-    );
   }
 
   Color _statusColor() {
     switch (_connectionState) {
       case BleConnectionState.disconnected:
-        return Colors.redAccent;
+        return const Color(0xFFE53935);
       case BleConnectionState.scanning:
       case BleConnectionState.connecting:
-        return Colors.amber;
+        return const Color(0xFFFFA000);
       case BleConnectionState.connected:
-        return Colors.greenAccent;
+        return const Color(0xFF43A047);
     }
   }
 
@@ -240,7 +205,7 @@ class _HomeScreenState extends State<HomeScreen> {
       case BleConnectionState.disconnected:
         return 'Disconnected';
       case BleConnectionState.scanning:
-        return 'Searching...';
+        return 'Scanning...';
       case BleConnectionState.connecting:
         return 'Connecting...';
       case BleConnectionState.connected:
@@ -248,245 +213,216 @@ class _HomeScreenState extends State<HomeScreen> {
     }
   }
 
-  Widget _buildBleButtonView() {
-    final disabled =
-        _connectionState == BleConnectionState.scanning ||
-        _connectionState == BleConnectionState.connecting;
+  @override
+  Widget build(BuildContext context) {
+    final isConnected = _connectionState == BleConnectionState.connected;
 
-    return Center(
-      child: Column(
-        mainAxisAlignment: MainAxisAlignment.center,
-        children: [
-          GestureDetector(
-            onTap: disabled ? null : _handleScan,
-            child: AnimatedContainer(
-              duration: const Duration(milliseconds: 220),
-              width: 210,
-              height: 210,
-              decoration: BoxDecoration(
-                shape: BoxShape.circle,
-                color: const Color(0xFF232C39),
-                border: Border.all(color: _statusColor(), width: 6),
-                boxShadow: [
-                  BoxShadow(
-                    color: _statusColor().withValues(alpha: 0.28),
-                    blurRadius: 18,
-                    spreadRadius: 4,
-                  ),
-                ],
-              ),
-              child: Icon(Icons.bluetooth, size: 110, color: _statusColor()),
-            ),
+    return Scaffold(
+      backgroundColor: const Color(0xFF111418),
+      appBar: AppBar(
+        backgroundColor: Colors.transparent,
+        elevation: 0,
+        title: const Text(
+          'AcciAlert',
+          style: TextStyle(fontWeight: FontWeight.w600, fontSize: 20),
+        ),
+        actions: [
+          IconButton(
+            icon: const Icon(Icons.warning_amber_rounded, color: Colors.orangeAccent),
+            tooltip: 'Test Alert',
+            onPressed: () {
+              _onAccidentDetected(
+                AccidentEvent(
+                  deviceId: _deviceName != '--' ? _deviceName : 'DEMO_DEVICE',
+                  lat: _lastLat ?? 20.363743,
+                  lon: _lastLon ?? 85.815004,
+                ),
+              );
+            },
           ),
-          const SizedBox(height: 20),
-          Text(
-            _statusLabel(),
-            style: TextStyle(
-              color: _statusColor(),
-              fontSize: 22,
-              fontWeight: FontWeight.w700,
-            ),
+          IconButton(
+            icon: const Icon(Icons.logout_rounded),
+            tooltip: 'Logout',
+            onPressed: _logout,
           ),
-          const SizedBox(height: 8),
-          const Text(
-            'Tap the button to scan and connect',
-            style: TextStyle(color: Colors.white70),
-          ),
+          const SizedBox(width: 8),
         ],
+      ),
+      body: SafeArea(
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 16),
+          child: Column(
+            children: [
+              const Spacer(flex: 1),
+
+              // Central Connection Target
+              if (!isConnected)
+                _buildDisconnectedState()
+              else
+                _buildConnectedState(),
+
+              const Spacer(flex: 2),
+
+              // Simple Emergency Contacts Button
+              SizedBox(
+                width: double.infinity,
+                height: 52,
+                child: OutlinedButton.icon(
+                  onPressed: _openContacts,
+                  style: OutlinedButton.styleFrom(
+                    foregroundColor: Colors.white,
+                    side: const BorderSide(color: Color(0xFF2C323B)),
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(14),
+                    ),
+                  ),
+                  icon: const Icon(Icons.people_outline, size: 20),
+                  label: const Text(
+                    'Emergency Contacts',
+                    style: TextStyle(fontSize: 15, fontWeight: FontWeight.w500),
+                  ),
+                ),
+              ),
+              const SizedBox(height: 12),
+            ],
+          ),
+        ),
       ),
     );
   }
 
-  Widget _buildConnectedView() {
+  Widget _buildDisconnectedState() {
+    final isScanning =
+        _connectionState == BleConnectionState.scanning ||
+        _connectionState == BleConnectionState.connecting;
+
     return Column(
-      mainAxisAlignment: MainAxisAlignment.start,
-      crossAxisAlignment: CrossAxisAlignment.stretch,
+      mainAxisSize: MainAxisSize.min,
       children: [
-        const SizedBox(height: 6),
-        GlassCard(
-          margin: EdgeInsets.zero,
-          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 12),
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Row(
-                children: [
-                  Container(
-                    padding: const EdgeInsets.all(12),
-                    decoration: BoxDecoration(
-                      color: Colors.greenAccent.withValues(alpha: 0.15),
-                      shape: BoxShape.circle,
-                    ),
-                    child: const Icon(
-                      Icons.bluetooth_connected,
-                      color: Colors.greenAccent,
-                      size: 28,
-                    ),
-                  ),
-                  const SizedBox(width: 16),
-                  Expanded(
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        const Text(
-                          'Active Device',
-                          style: TextStyle(
-                            fontSize: 13,
-                            color: Colors.white70,
-                            fontWeight: FontWeight.w600,
-                            letterSpacing: 0.5,
-                          ),
-                        ),
-                        Text(
-                          _deviceName,
-                          style: const TextStyle(
-                            fontSize: 22,
-                            fontWeight: FontWeight.w800,
-                          ),
-                        ),
-                      ],
-                    ),
-                  ),
-                ],
+        GestureDetector(
+          onTap: isScanning ? null : _handleScan,
+          child: Container(
+            width: 180,
+            height: 180,
+            decoration: BoxDecoration(
+              shape: BoxShape.circle,
+              color: const Color(0xFF1A1F26),
+              border: Border.all(
+                color: _statusColor().withValues(alpha: 0.5),
+                width: 3,
               ),
-              const SizedBox(height: 12),
-              Container(
-                padding: const EdgeInsets.all(10),
-                decoration: BoxDecoration(
-                  color: Theme.of(
-                    context,
-                  ).colorScheme.surfaceContainerHighest.withValues(alpha: 0.3),
-                  borderRadius: BorderRadius.circular(16),
-                  border: Border.all(
-                    color: Theme.of(
-                      context,
-                    ).colorScheme.outlineVariant.withValues(alpha: 0.3),
-                  ),
-                ),
-                child: Column(
-                  children: [
-                    _deviceDetailBlock(
-                      context,
-                      icon: Icons.battery_charging_full_rounded,
-                      header: 'Battery Remaining',
-                      value: _batteryText,
-                      valueColor: _batteryText.contains('%')
-                          ? ((int.tryParse(_batteryText.replaceAll('%', '')) ??
-                                        100) >
-                                    20
-                                ? Colors.greenAccent
-                                : Colors.redAccent)
-                          : null,
-                    ),
-                    const Padding(
-                      padding: EdgeInsets.symmetric(vertical: 12),
-                      child: Divider(height: 1),
-                    ),
-                    _deviceDetailBlock(
-                      context,
-                      icon: Icons.location_on_outlined,
-                      header: 'Last Known Location',
-                      value: _lastLat != null && _lastLon != null
-                          ? '${_lastLat!.toStringAsFixed(5)}, ${_lastLon!.toStringAsFixed(5)}'
-                          : 'Waiting for GPS...',
-                    ),
-                  ],
-                ),
-              ),
-            ],
-          ),
-        ),
-        const SizedBox(height: 12),
-        FilledButton.icon(
-          onPressed: () => _bleService.disconnect(),
-          icon: const Icon(Icons.bluetooth_disabled),
-          style: FilledButton.styleFrom(
-            backgroundColor: Colors.redAccent.withValues(alpha: 0.15),
-            foregroundColor: Colors.redAccent,
-            padding: const EdgeInsets.symmetric(vertical: 12),
-            shape: RoundedRectangleBorder(
-              borderRadius: BorderRadius.circular(16),
+            ),
+            child: Icon(
+              isScanning ? Icons.bluetooth_searching : Icons.bluetooth,
+              size: 80,
+              color: _statusColor(),
             ),
           ),
-          label: const Text(
-            'Disconnect Device',
-            style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
+        ),
+        const SizedBox(height: 28),
+        Text(
+          _statusLabel(),
+          style: TextStyle(
+            color: _statusColor(),
+            fontSize: 20,
+            fontWeight: FontWeight.w600,
           ),
         ),
-        const SizedBox(height: 10),
-        OutlinedButton.icon(
-          onPressed: _openContacts,
-          icon: const Icon(Icons.contacts),
-          style: OutlinedButton.styleFrom(
-            padding: const EdgeInsets.symmetric(vertical: 12),
-            shape: RoundedRectangleBorder(
-              borderRadius: BorderRadius.circular(16),
-            ),
-          ),
-          label: const Text(
-            'Emergency Contacts',
-            style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
-          ),
+        const SizedBox(height: 8),
+        Text(
+          isScanning
+              ? 'Looking for nearby device'
+              : 'Tap to scan and connect',
+          style: const TextStyle(color: Colors.white54, fontSize: 14),
         ),
       ],
     );
   }
 
-  Widget _deviceDetailBlock(
-    BuildContext context, {
-    required IconData icon,
-    required String header,
-    required String value,
-    Color? valueColor,
-  }) {
-    return Row(
-      crossAxisAlignment: CrossAxisAlignment.center,
-      children: [
-        Container(
-          padding: const EdgeInsets.all(10),
-          decoration: BoxDecoration(
-            color: Theme.of(
-              context,
-            ).colorScheme.surfaceContainerHighest.withValues(alpha: 0.5),
-            shape: BoxShape.circle,
-          ),
-          child: Icon(
-            icon,
-            size: 22,
-            color: Theme.of(
-              context,
-            ).colorScheme.onSurface.withValues(alpha: 0.8),
-          ),
-        ),
-        const SizedBox(width: 14),
-        Expanded(
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
+  Widget _buildConnectedState() {
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.all(24),
+      decoration: BoxDecoration(
+        color: const Color(0xFF1A1F26),
+        borderRadius: BorderRadius.circular(20),
+        border: Border.all(color: const Color(0xFF2C323B)),
+      ),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
             children: [
-              Text(
-                header,
-                style: TextStyle(
-                  fontSize: 12,
-                  fontWeight: FontWeight.w600,
-                  letterSpacing: 0.3,
-                  color: Theme.of(
-                    context,
-                  ).colorScheme.onSurface.withValues(alpha: 0.75),
+              Container(
+                width: 10,
+                height: 10,
+                decoration: const BoxDecoration(
+                  shape: BoxShape.circle,
+                  color: Color(0xFF43A047),
                 ),
               ),
-              const SizedBox(height: 2),
-              Text(
-                value,
+              const SizedBox(width: 8),
+              const Text(
+                'CONNECTED',
                 style: TextStyle(
-                  fontSize: 16,
-                  fontWeight: FontWeight.w600,
-                  color: valueColor,
+                  color: Color(0xFF43A047),
+                  fontSize: 12,
+                  fontWeight: FontWeight.w700,
+                  letterSpacing: 0.8,
                 ),
               ),
             ],
           ),
-        ),
-      ],
+          const SizedBox(height: 12),
+          Text(
+            _deviceName,
+            style: const TextStyle(
+              fontSize: 22,
+              fontWeight: FontWeight.bold,
+              color: Colors.white,
+            ),
+          ),
+          const SizedBox(height: 20),
+          Row(
+            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+            children: [
+              const Text('Battery', style: TextStyle(color: Colors.white54)),
+              Text(_batteryText, style: const TextStyle(color: Colors.white, fontWeight: FontWeight.w500)),
+            ],
+          ),
+          const Divider(height: 24, color: Color(0xFF2C323B)),
+          Row(
+            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+            children: [
+              const Text('Location', style: TextStyle(color: Colors.white54)),
+              Text(
+                _lastLat != null
+                    ? '${_lastLat!.toStringAsFixed(4)}, ${_lastLon!.toStringAsFixed(4)}'
+                    : 'Awaiting fix',
+                style: const TextStyle(color: Colors.white, fontWeight: FontWeight.w500),
+              ),
+            ],
+          ),
+          const SizedBox(height: 24),
+          SizedBox(
+            width: double.infinity,
+            height: 44,
+            child: ElevatedButton(
+              onPressed: _handleDisconnect,
+              style: ElevatedButton.styleFrom(
+                backgroundColor: const Color(0xFF2C1E20),
+                foregroundColor: const Color(0xFFE53935),
+                elevation: 0,
+                shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(12),
+                ),
+              ),
+              child: const Text('Disconnect'),
+            ),
+          ),
+        ],
+      ),
     );
   }
 }

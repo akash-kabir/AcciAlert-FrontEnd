@@ -3,18 +3,20 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 
 import '../services/ble_service.dart';
+import '../services/sms_service.dart';
 import '../services/webhook_service.dart';
 
-/// Full-screen alert shown when an accident is detected.
-/// User has 10 seconds to cancel before the alert is sent.
+/// Clean, spacious accident alert countdown screen.
 class AccidentAlertScreen extends StatefulWidget {
   final AccidentEvent event;
-  final WebhookService webhookService;
+  final SmsService? smsService;
+  final WebhookService? webhookService;
 
   const AccidentAlertScreen({
     super.key,
     required this.event,
-    required this.webhookService,
+    this.smsService,
+    this.webhookService,
   });
 
   @override
@@ -56,7 +58,12 @@ class _AccidentAlertScreenState extends State<AccidentAlertScreen> {
     if (_cancelled) return;
     setState(() => _sending = true);
 
-    final success = await widget.webhookService.sendAccidentAlert(widget.event);
+    final sms = widget.smsService ?? SmsService();
+    final success = await sms.sendAccidentAlert(widget.event);
+
+    if (widget.webhookService != null) {
+      widget.webhookService!.sendAccidentAlert(widget.event);
+    }
 
     if (!mounted) return;
     setState(() {
@@ -65,8 +72,8 @@ class _AccidentAlertScreenState extends State<AccidentAlertScreen> {
     });
 
     final message = success
-        ? 'Emergency alert sent successfully!'
-        : 'Failed to send alert. Check internet connection.';
+        ? 'Emergency alert sent to contacts'
+        : 'Failed to send alert';
 
     ScaffoldMessenger.of(context).showSnackBar(
       SnackBar(
@@ -75,7 +82,6 @@ class _AccidentAlertScreenState extends State<AccidentAlertScreen> {
       ),
     );
 
-    // Auto-close after showing result
     await Future.delayed(const Duration(seconds: 2));
     if (mounted) Navigator.of(context).pop();
   }
@@ -95,133 +101,116 @@ class _AccidentAlertScreenState extends State<AccidentAlertScreen> {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      backgroundColor: Colors.red.shade900,
+      backgroundColor: const Color(0xFF1A0A0C),
       body: SafeArea(
-        child: Center(
-          child: Padding(
-            padding: const EdgeInsets.all(32),
-            child: Column(
-              mainAxisAlignment: MainAxisAlignment.center,
-              children: [
-                const Icon(
-                  Icons.warning_amber_rounded,
-                  color: Colors.white,
-                  size: 100,
-                ),
-                const SizedBox(height: 24),
-                const Text(
-                  'ACCIDENT DETECTED',
-                  style: TextStyle(
-                    color: Colors.white,
-                    fontSize: 28,
-                    fontWeight: FontWeight.bold,
-                  ),
-                ),
-                const SizedBox(height: 16),
-                Text(
-                  'Device: ${widget.event.deviceId}',
-                  style: const TextStyle(color: Colors.white70, fontSize: 16),
-                ),
-                Text(
-                  'Location: ${widget.event.lat.toStringAsFixed(6)}, ${widget.event.lon.toStringAsFixed(6)}',
-                  style: const TextStyle(color: Colors.white70, fontSize: 16),
-                ),
-                const SizedBox(height: 40),
-                if (!_sent && !_cancelled && !_sending) ...[
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 28, vertical: 24),
+          child: Column(
+            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+            children: [
+              const SizedBox(height: 12),
+
+              // Title
+              Column(
+                children: const [
                   Text(
-                    'Sending alert in',
+                    'Accident Detected',
                     style: TextStyle(
-                      color: Colors.white.withValues(alpha: 0.8),
-                      fontSize: 18,
-                    ),
-                  ),
-                  const SizedBox(height: 8),
-                  Text(
-                    '$_remaining',
-                    style: const TextStyle(
                       color: Colors.white,
-                      fontSize: 72,
+                      fontSize: 24,
                       fontWeight: FontWeight.bold,
                     ),
                   ),
-                  const SizedBox(height: 8),
-                  const Text(
-                    'seconds',
-                    style: TextStyle(color: Colors.white70, fontSize: 18),
+                  SizedBox(height: 8),
+                  Text(
+                    'Sending emergency alert if no response',
+                    style: TextStyle(color: Colors.white54, fontSize: 14),
                   ),
-                  const SizedBox(height: 40),
-                  SizedBox(
-                    width: double.infinity,
-                    height: 60,
-                    child: ElevatedButton(
-                      onPressed: _cancelAlert,
-                      style: ElevatedButton.styleFrom(
-                        backgroundColor: Colors.white,
-                        foregroundColor: Colors.red.shade900,
-                        shape: RoundedRectangleBorder(
-                          borderRadius: BorderRadius.circular(16),
-                        ),
+                ],
+              ),
+
+              // Countdown display
+              if (!_sent && !_cancelled && !_sending) ...[
+                Column(
+                  children: [
+                    Text(
+                      '$_remaining',
+                      style: const TextStyle(
+                        color: Color(0xFFEF5350),
+                        fontSize: 96,
+                        fontWeight: FontWeight.w300,
+                        height: 1.0,
                       ),
-                      child: const Text(
-                        "I'M OK — CANCEL ALERT",
-                        style: TextStyle(
-                          fontSize: 18,
-                          fontWeight: FontWeight.bold,
+                    ),
+                    const SizedBox(height: 8),
+                    const Text(
+                      'seconds',
+                      style: TextStyle(color: Colors.white38, fontSize: 16),
+                    ),
+                  ],
+                ),
+              ],
+
+              if (_sending)
+                const Column(
+                  children: [
+                    CircularProgressIndicator(color: Colors.redAccent),
+                    SizedBox(height: 16),
+                    Text('Sending alerts...', style: TextStyle(color: Colors.white70)),
+                  ],
+                ),
+
+              if (_sent)
+                const Column(
+                  children: [
+                    Icon(Icons.check_circle_outline, color: Colors.greenAccent, size: 54),
+                    SizedBox(height: 12),
+                    Text('Alert Sent', style: TextStyle(color: Colors.white, fontSize: 20)),
+                  ],
+                ),
+
+              // Actions
+              if (!_sent && !_cancelled && !_sending)
+                Column(
+                  children: [
+                    SizedBox(
+                      width: double.infinity,
+                      height: 56,
+                      child: ElevatedButton(
+                        onPressed: _cancelAlert,
+                        style: ElevatedButton.styleFrom(
+                          backgroundColor: Colors.white,
+                          foregroundColor: Colors.black,
+                          elevation: 0,
+                          shape: RoundedRectangleBorder(
+                            borderRadius: BorderRadius.circular(16),
+                          ),
+                        ),
+                        child: const Text(
+                          "I'M OK — CANCEL",
+                          style: TextStyle(
+                            fontSize: 16,
+                            fontWeight: FontWeight.w700,
+                          ),
                         ),
                       ),
                     ),
-                  ),
-                  const SizedBox(height: 12),
-                  SizedBox(
-                    width: double.infinity,
-                    height: 48,
-                    child: OutlinedButton(
+                    const SizedBox(height: 12),
+                    TextButton(
                       onPressed: () {
                         _timer?.cancel();
                         _sendAlert();
                       },
-                      style: OutlinedButton.styleFrom(
-                        foregroundColor: Colors.white,
-                        side: const BorderSide(color: Colors.white54),
-                        shape: RoundedRectangleBorder(
-                          borderRadius: BorderRadius.circular(16),
-                        ),
-                      ),
                       child: const Text(
-                        'SEND NOW',
-                        style: TextStyle(fontSize: 16),
+                        'Send Now',
+                        style: TextStyle(color: Colors.white54),
                       ),
                     ),
-                  ),
-                ],
-                if (_sending)
-                  const Column(
-                    children: [
-                      CircularProgressIndicator(color: Colors.white),
-                      SizedBox(height: 16),
-                      Text(
-                        'Sending emergency alert...',
-                        style: TextStyle(color: Colors.white, fontSize: 18),
-                      ),
-                    ],
-                  ),
-                if (_sent)
-                  const Column(
-                    children: [
-                      Icon(Icons.check_circle, color: Colors.white, size: 60),
-                      SizedBox(height: 16),
-                      Text(
-                        'Alert Sent!',
-                        style: TextStyle(
-                          color: Colors.white,
-                          fontSize: 24,
-                          fontWeight: FontWeight.bold,
-                        ),
-                      ),
-                    ],
-                  ),
-              ],
-            ),
+                  ],
+                )
+              else
+                const SizedBox(height: 48),
+            ],
           ),
         ),
       ),
